@@ -16,7 +16,9 @@ public class MPM_Simulation : MonoBehaviour {
     public GameObject marker;
 
     public Mesh instancedMesh;
-    public Material instancedMaterial;
+    public Material innerMaterial;
+    public Material outerMaterial;
+
     private List<List<Particle>> batches = new List<List<Particle>>();
 
     struct Particle {
@@ -27,11 +29,12 @@ public class MPM_Simulation : MonoBehaviour {
         public float mass;
         public float volume_0; // initial volume
         public bool pinned;
+        public bool isOuter;
         public Matrix4x4 matrix
         {
             get
             {
-                return Matrix4x4.TRS(new Vector3(x.x,x.y,x.z), Quaternion.identity, new Vector3(particle_size, particle_size, particle_size));
+                return Matrix4x4.TRS(new Vector3(x.x, x.y, x.z), Quaternion.identity, new Vector3(particle_size, particle_size, particle_size));
             }
         }
     }
@@ -42,27 +45,28 @@ public class MPM_Simulation : MonoBehaviour {
         public Vector3Int index3d;
         public bool pinned;
     }
-    const float particle_size = 0.5f;
+    //Resolutions
+    const float particle_size = 0.8f;
     const int grid_res = 64;
-    float3 particle_res = new float3(64,64,16);
+    float3 particle_res = new float3(32,32,16);
     const int num_cells = grid_res * grid_res * grid_res;
 
-    // batch size for the job system. just determined experimentally
+    // batch size for the job system.
     const int division = 16;
     
-    // simulation parameters
+    //Parameters
     const float dt = 0.1f; // timestep
     const float iterations = (int)(1.0f / dt);
-    const float gravity = -0.05f;
+    const float gravity = -0.60f;
 
     const int DISTANCE = 3;
     const float dx = 1.0f / grid_res;
     const float inv_dx = 1.0f;  
 
-    // Lamé parameters for stress-strain relationship
-    const float elastic_lambda = 20.0f;
-    const float elastic_mu = 10.0f;
+    const float lambda = 20.0f;
+    const float mu = 10.0f;
     
+    //Declarations
     NativeArray<Particle> ps; // particles
     NativeArray<Cell> grid;
 
@@ -74,30 +78,22 @@ public class MPM_Simulation : MonoBehaviour {
             );
     int num_particles;
     List<float3> temp_positions;
-    
+    List<int3> temp_indices;
+
     #if MOUSE_INTERACTION
     // interaction
     const float mouse_radius = 10;
     bool mouse_down = false;
     float3 mouse_pos;
-    #endif
+#endif
     void createParticles(float3 sp, float3 res) {
         const float spacing = 0.5f;
-        //for (float i = - box_x / 2; i < box_x / 2; i += spacing) {
-        //    for (float j = - box_y / 2; j < box_y / 2; j += spacing) {
-        //        for (float k = -box_z / 2; k < box_z / 2; k += spacing)
-        //        {
-        //            var pos = math.float3(x + i, y + j, z + k);
-
-        //            temp_positions.Add(pos);
-        //        }
-        //    }
-        //}        
         float3 real_Res = res * spacing;
         for (float i = 0; i < real_Res[0]; i += spacing) {
             for (float j = 0; j < real_Res[1]; j += spacing) {
                 for (float k = 0; k < real_Res[2]; k += spacing) {
                     temp_positions.Add(math.float3(i, j, k) + sp);
+                    temp_indices.Add((int3)(math.float3(i,j,k) * 2));
                 }
             }
         }
@@ -106,13 +102,11 @@ public class MPM_Simulation : MonoBehaviour {
     void Start () {
         // create particles initial positions
         temp_positions = new List<float3>();
+        temp_indices = new List<int3>();
         createParticles(new float3(grid_res / 2, grid_res / 2, grid_res / 2), particle_res);
         num_particles = temp_positions.Count;
-        //print(num_particles +"   " +math.pow(particle_res*2, 3));
 
         ps = new NativeArray<Particle>(num_particles, Allocator.Persistent);
-
-
 
         // initialise particles
         List<Particle> currBatch = new List<Particle>();
@@ -125,20 +119,15 @@ public class MPM_Simulation : MonoBehaviour {
             p.F = identity;
             
             p.mass = 1.0f;
-            //int x = i % particle_res;
-            int y = (int)((i / particle_res.x) % particle_res.y);
-            //int z = i / (particle_res * particle_res);
-            //if (x < 2 || x > particle_res - 3) { p.pinned = 0; }
-            // if (y < 2 || y > particle_res - 3) { p.pinned = 0; }
-            if (y > particle_res.y - 3)
-            {
-                p.pinned = true;
-                
-            } 
-            else
-            {
-                p.pinned = false;
-            }
+
+            var p_idx = temp_indices[i];
+            if (p_idx[1] > particle_res.y - 3)  { p.pinned = true; } 
+            else { p.pinned = false;}
+
+            if (p_idx.x > particle_res.x - 2 || p_idx.x < 1 || p_idx.y > particle_res.y - 2 || p_idx.y < 1 || p_idx.z < 1 || p_idx.z > particle_res.z - 2) 
+            { p.isOuter = true; }
+            else { p.isOuter = false; }
+
             ps[i] = p;
             
             //GPU splitting particle data
@@ -176,8 +165,6 @@ public class MPM_Simulation : MonoBehaviour {
                 }
             }
         }
-        // ---- begin precomputation of particle volumes
-        // MPM course, equation 152 
 
         //launch a P2G job to scatter particle mass to the grid
         new Job_P2G()
@@ -242,11 +229,6 @@ public class MPM_Simulation : MonoBehaviour {
 #endif
 
         Simulate();
-
-        //for(int i=0; i < iterations; i++)
-        //{
-
-        //}
         UpdateBatches();
         RenderFrameGPU();
     }
@@ -272,7 +254,24 @@ public class MPM_Simulation : MonoBehaviour {
     {
         foreach(var batch in batches)
         {
-            Graphics.DrawMeshInstanced(instancedMesh, 0, instancedMaterial, batch.Select((a) => a.matrix).ToList());
+            //dela upp batch i 2 delar, loopa igenom och splitta materialen
+            var outerBatch = new List<Particle>();
+            var innerBatch = new List<Particle>();
+
+            foreach(var p in batch)
+            {
+                if(p.isOuter)
+                {
+                    outerBatch.Add(p);
+                }
+                else
+                {
+                    innerBatch.Add(p);
+                }
+            }
+
+            Graphics.DrawMeshInstanced(instancedMesh, 0, innerMaterial, innerBatch.Select((a) => a.matrix).ToList());
+            Graphics.DrawMeshInstanced(instancedMesh, 0, outerMaterial, outerBatch.Select((a) => a.matrix).ToList());
         }
 
     }
@@ -365,8 +364,8 @@ public class MPM_Simulation : MonoBehaviour {
                 var F_minus_F_inv_T = F - F_inv_T;
 
                 // MPM course equation 48
-                var P_term_0 = elastic_mu * (F_minus_F_inv_T);
-                var P_term_1 = elastic_lambda * math.log(J) * F_inv_T;
+                var P_term_0 = mu * (F_minus_F_inv_T);
+                var P_term_1 = lambda * math.log(J) * F_inv_T;
                 var P = P_term_0 + P_term_1;
 
                 float Dinv = 4 * inv_dx * inv_dx;
