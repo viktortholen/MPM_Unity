@@ -18,7 +18,7 @@
 
             #include "UnityCG.cginc"
 
-            struct appdata_t
+            struct appdata
             {
                 float4 vertex : POSITION;
                 float4 color : COLOR;
@@ -39,7 +39,7 @@
             sampler2D _MainTex;
             float4 _MainTex_ST;
 
-            v2f vert (appdata_t i, uint instanceID: SV_InstanceID)
+            v2f vert (appdata i, uint instanceID: SV_InstanceID)
             {
                 v2f o;
                 float4 pos = mul(_Properties[instanceID].mat, i.vertex);

@@ -1,4 +1,8 @@
-﻿using Unity.Collections;
+﻿//#define PINNED
+//#define CUBIC
+
+
+using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using Unity.Burst;
@@ -9,6 +13,8 @@ using System.Linq;
 using UnityEngine.Profiling;
 using Unity.Collections.LowLevel.Unsafe;
 using System.Runtime.InteropServices;
+
+
 
 public class MPM_Simulation : MonoBehaviour {
 
@@ -57,20 +63,27 @@ public class MPM_Simulation : MonoBehaviour {
     //Parameters
     const float dt = 0.1f; // timestep
     const float iterations = (int)(1.0f / dt);
-    const float gravity = -0.60f;
+    const float gravity = -0.3f;
 
-    const int DISTANCE = 3;
+#if CUBIC
+    const int DISTANCE = 2;
+    const int Dinv = 3;
+#else
+    const int DISTANCE = 1;
+    const float Dinv = 4 * inv_dx * inv_dx;
+#endif
+
     const float dx = 1.0f / grid_res;
-    const float inv_dx = 1.0f;  
+    const float inv_dx = 1.0f;
 
-    const float lambda = 20.0f;
-    const float mu = 10.0f;
+    const float lambda = 10.0f;
+    const float mu = 20.0f; //>= lambda
     
     //Declarations
     NativeArray<Particle> ps; // particles
     NativeArray<Cell> grid;
 
-    float3[] weights = new float3[3];
+    //float3[] weights = new float3[DISTANCE];
     static readonly float3x3 identity = math.float3x3(
                 1, 0, 0,
                 0, 1, 0,
@@ -80,7 +93,7 @@ public class MPM_Simulation : MonoBehaviour {
     List<float3> temp_positions;
     List<int3> temp_indices;
 
-    #if MOUSE_INTERACTION
+#if MOUSE_INTERACTION
     // interaction
     const float mouse_radius = 10;
     bool mouse_down = false;
@@ -174,60 +187,100 @@ public class MPM_Simulation : MonoBehaviour {
             num_particles = num_particles
         }.Schedule().Complete();
 
+        float3 max = 0;
+        float3 min = 0;
+
+
         for (int i = 0; i < num_particles; ++i) {
             var p = ps[i];
             // quadratic interpolation weights
-            float3 cell_idx = math.floor(p.x);
-            float3 cell_diff = (p.x - cell_idx) - 0.5f;
-            //print(cell_diff);
-            weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);
-            weights[1] = 0.75f - math.pow(cell_diff, 2);
-            weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);
+            float3 cell_idx = math.floor(p.x); //integer 0-res
+                                               //float3 cell_diff = (p.x - cell_idx) - 0.5f; //float -0.5 -> 0.5
 
+
+            //cell_idx - 1
+            //cell_idx - 1 + 1
+            //cell_idx - 1 + 2
+            //print(cell_diff);
+            //weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);  //  0   -> 0.5
+            //weights[1] = 0.75f - math.pow(cell_diff, 2);        //  0.25-> 0.75
+            //weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);  //  0   -> 0.5
+            //float h = 1.0f;
+            //weights[0] = 0.375f * ((1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
+            //weights[1] = 0.375f * ((-1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));
+            //weights[2] = 0.375f * ((1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));  //  0   -> 0.5
+            //weights[3] = 0.375f * ((-1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
             //if (i == 6343)
             //{ 
+
             float density = 0.0f;
             // iterate over neighbouring 3x3 cells
-            for (int gx = 0; gx < DISTANCE; ++gx) {
-                for (int gy = 0; gy < DISTANCE; ++gy) {
-                    for (int gz = 0; gz < DISTANCE; ++gz)
+            for (int gx = -DISTANCE; gx <= DISTANCE; ++gx)
+            {
+                for (int gy = -DISTANCE; gy <= DISTANCE; ++gy)
+                {
+                    for (int gz = -DISTANCE; gz <= DISTANCE; ++gz)
                     {
+                        float3 pos = cell_idx + new float3(gx, gy, gz);
+                        float3 diff = (p.x - (float3)pos) - 0.5f; //* cell_diff
+                        float weight = Interpolate(diff);
+                        //print(weight + " diff:" + diff + " pos: " + pos);
+                        //if (diff.x > max.x) max.x = diff.x;
+                        //if (diff.y > max.y) max.y = diff.y;
+                        //if (diff.z > max.z) max.z = diff.z;
+                        
+                        //if (diff.x < min.x) min.x = diff.x;
+                        //if (diff.y < min.y) min.y = diff.y;
+                        //if (diff.z < min.z) min.z = diff.z;
                         //float weight = weights[gx].x * weights[gy].y * weights[gz].z;
-                        float weight = weights[gx].x * weights[gy].y * weights[gz].z;
-                        
+                        //print(pos_x + ", " + pos_y + ", " + pos_z + " -> "+ wx + ", " + wy + ", " + wz);
+
                         // map 2D to 1D index in grid
-                        int cell_index = ((int)cell_idx.x + (gx - 1)) + (grid_res * ((int)cell_idx.y + gy - 1)) + (grid_res * grid_res * ((int)cell_idx.z + (gz - 1))); //??
-                        
+                        //int cell_index = ((int)cell_idx.x + (gx - (DISTANCE - 2))) + (grid_res * ((int)cell_idx.y + gy - (DISTANCE - 2))) + (grid_res * grid_res * ((int)cell_idx.z + (gz - (DISTANCE - 2)))); //??
+                        //int3 cell_x = math.int3(cell_idx.x + gx - (DISTANCE - 2), cell_idx.y + gy - (DISTANCE - 2), cell_idx.z + gz - (DISTANCE - 2));
+                        //int cell_index = (int)pos.x + (grid_res * (int)pos.y) + (grid_res * grid_res * (int)pos.z);
+                        int cell_index = GetGridIndex(pos);
+                        // scatter mass and momentum to the grid
+                        //int cell_index = (int)(((int)cell_x.x + (grid_res * (int)cell_x.y) + (grid_res * grid_res * (int)cell_x.z)) * dx);
+
                         //print("idx" + cell_index + "mass" + grid[cell_index].mass);
                         //var o = Instantiate(marker, grid[cell_index].index3d, Quaternion.identity);
-                            //o.transform.localScale = new Vector3(weight, weight, weight);
+                        //o.transform.localScale = new Vector3(weight, weight, weight);
                         density += grid[cell_index].mass * weight;
+#if PINNED
                         if (p.pinned)
                         {
                             density *= 100;
                         }
+#endif
                     }
                 }
-           // }
+            }
             float volume = p.mass / density;
             p.volume_0 = volume;
             
-            }
+            
             // per-particle volume estimate has now been computed
             
 
             ps[i] = p;
         }
+        //print(min.x + ", " + min.y + " , " + min.z);
+        //print(max.x + ", " + max.y + " , " + max.z);
 
         batches.Add(currBatch);
 
     }
-
+    public int itx = 0;
     private void Update() {
 #if MOUSE_INTERACTION
         HandleMouseInteraction();
 #endif
-
+        //for(int i = 0; i < iterations; i++)
+        //{
+            
+        //}
+        //itx++;
         Simulate();
         UpdateBatches();
         RenderFrameGPU();
@@ -275,7 +328,51 @@ public class MPM_Simulation : MonoBehaviour {
         }
 
     }
+    public static float Interpolate(float3 pos )
+    {
+#if CUBIC
+        return (InterpolateCubic(pos.x) * InterpolateCubic(pos.y) * InterpolateCubic(pos.z));
+#else
+        return (InterpolateQuadratic(pos.x) * InterpolateQuadratic(pos.y) * InterpolateQuadratic(pos.z));
+#endif
+    }
+    public static int GetGridIndex(float3 pos)
+    {
+        return (int)pos.x + (grid_res * (int)pos.y) + (grid_res * grid_res * (int)pos.z);
+    }
+    public static float InterpolateCubic(float p)
+    {
+        float x = math.abs(p);
 
+        float w;
+        if (x < 1.0f)
+        {
+            w = (1.0f / 2.0f) * math.pow(x, 3.0f) - math.pow(x, 2.0f) + (2.0f / 3.0f); //x * (x * (-x / 6 + 1) - 2) + 4 / 3.0f;
+        }
+        else if (x < 2.0f)
+        {
+            w = (-1.0f / 6.0f) * math.pow(x, 3.0f) + math.pow(x, 2.0f) - (2.0f * x) + (4.0f / 3.0f); //Joel Wretborn diva
+            //w = (-1.0f / 6.0f) * math.pow(2 - x, 3.0f); //MPMcourse
+        }
+        else w = 0.0f;
+
+        //if (x < 0.001) return 0;
+
+        return w;
+    }
+    public static float InterpolateQuadratic(float p)
+    {
+        float x = math.abs(p);
+
+        float w;
+        if (x < 0.5f)
+            w = (3.0f / 4.0f) - math.pow(x, 2.0f);
+        else if (x < 1.5f)
+            w = (1.0f / 2.0f) * math.pow((3.0f / 2.0f) - x, 2.0f);
+        else w = 0.0f;
+        //if (w < 0.0001) return 0;
+        return w;
+    }
 #if MOUSE_INTERACTION
     void HandleMouseInteraction() {
         mouse_down = false;
@@ -313,10 +410,10 @@ public class MPM_Simulation : MonoBehaviour {
         new Job_G2P() {
             ps = ps,
             //Fs = Fs,
-            #if MOUSE_INTERACTION
+#if MOUSE_INTERACTION
             mouse_down = mouse_down,
             mouse_pos = mouse_pos,
-            #endif
+#endif
             grid = grid
         }.Schedule(num_particles, division).Complete();
         Profiler.EndSample();
@@ -343,7 +440,7 @@ public class MPM_Simulation : MonoBehaviour {
         [ReadOnly] public int num_particles;
         
         public void Execute() {
-            var weights = stackalloc float3[3];
+           // var weights = stackalloc float3[DISTANCE];
 
             for (int i = 0; i < num_particles; ++i) {
                 var p = ps[i];
@@ -368,10 +465,10 @@ public class MPM_Simulation : MonoBehaviour {
                 var P_term_1 = lambda * math.log(J) * F_inv_T;
                 var P = P_term_0 + P_term_1;
 
-                float Dinv = 4 * inv_dx * inv_dx;
+                
                 // cauchy_stress = (1 / det(F)) * P * F_T
                 // equation 38, MPM course
-                stress = (1.0f / J) * Dinv * math.mul(P, F_T);
+                stress = (1.0f / J) * math.mul(P, F_T);
                 
                 // (M_p)^-1 = 4, see APIC paper and MPM course page 42
                 // this term is used in MLS-MPM paper eq. 16. with quadratic weights, Mp = (1/4) * (delta_x)^2.
@@ -380,27 +477,36 @@ public class MPM_Simulation : MonoBehaviour {
                 var eq_16_term_0 = -volume * Dinv * stress * dt;
 
                 // quadratic interpolation weights
-                uint3 cell_idx = (uint3)(p.x);
-                float3 cell_diff = (p.x - cell_idx) - 0.5f;
+                int3 cell_idx = (int3)(p.x);
+                //float3 cell_diff = (p.x - cell_idx) - 0.5f;
                 //print(cell_diff);
-                weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);
-                weights[1] = 0.75f - math.pow(cell_diff, 2);
-                weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);
-
-
+                //weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);//x = cell_diff
+                //weights[1] = 0.75f - math.pow(cell_diff, 2);//x = cell_diff - 1
+                //weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);//x = cell_diff - 2
+                //float h = 1.0f;
+                //weights[0] = 0.375f * ((1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
+                //weights[1] = 0.375f * ((-1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));
+                //weights[2] = 0.375f * ((1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));  //  0   -> 0.5
+                //weights[3] = 0.375f * ((-1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
                 // for all surrounding 9 cells
-                for (uint gx = 0; gx < DISTANCE; ++gx) {
-                    for (uint gy = 0; gy < DISTANCE; ++gy) {
-                        for (uint gz = 0; gz < DISTANCE; ++gz)
+                for (int gx = -DISTANCE; gx <= DISTANCE; ++gx)
+                {
+                    for (int gy = -DISTANCE; gy <= DISTANCE; ++gy)
+                    {
+                        for (int gz = -DISTANCE; gz <= DISTANCE; ++gz)
                         {
-                            float weight = weights[gx].x * weights[gy].y * weights[gz].z;
-
-                            uint3 cell_x = math.uint3(cell_idx.x + gx - 1, cell_idx.y + gy - 1, cell_idx.z + gz - 1);
-                            float3 cell_dist = (cell_x - p.x) + 0.5f;
-                            float3 Q = math.mul(p.C, cell_dist);
+                            float3 pos = cell_idx + new float3(gx, gy, gz);
+                            float3 diff = (p.x - (float3)pos) - 0.5f; //kolla vilka värden diff är mellan -> -0.5 i interpoleringen?
+                            float weight = Interpolate(diff);
+                            //float weight = weights[gx].x * weights[gy].y * weights[gz].z;
+                            float3 dist = ((float3)pos - p.x) + 0.5f;
+                            //int3 cell_x = math.int3(cell_idx.x + gx, cell_idx.y + gy, cell_idx.z + gz);
+                            //float3 cell_dist = (cell_x - p.x) + 0.5f;
+                            float3 Q = math.mul(p.C, dist);
 
                             // scatter mass and momentum to the grid
-                            int cell_index = (int)cell_x.x + (grid_res * (int)cell_x.y) + (grid_res * grid_res * (int)cell_x.z);
+                            //int cell_index = (int)pos.x + (grid_res * (int)pos.y) + (grid_res * grid_res * (int)pos.z);
+                            int cell_index = GetGridIndex(pos);
                             Cell cell = grid[cell_index];
 
                             // MPM course, equation 172
@@ -412,15 +518,16 @@ public class MPM_Simulation : MonoBehaviour {
 
                             // fused force/momentum update from MLS-MPM
                             // see MLS-MPM paper, equation listed after eqn. 28
-                            float3 momentum = math.mul(eq_16_term_0 * weight, cell_dist);
+                            float3 momentum = math.mul(eq_16_term_0 * weight, dist);
                             cell.v += momentum;
-
+#if PINNED
                             if (p.pinned)
                             {
                                 cell.v = 0;
                                 cell.pinned = true;
                                 //cell.mass *= 100;
                             }
+#endif
                             // total update on cell.v is now:
                             // weight * (dt * M^-1 * p.volume * p.stress + p.mass * p.C)
                             // this is the fused momentum + force from MLS-MPM. however, instead of our stress being derived from the energy density,
@@ -446,7 +553,7 @@ public class MPM_Simulation : MonoBehaviour {
         public void Execute(int i) {
             var cell = grid[i];
 
-            if (cell.mass > 0) {
+            if (cell.mass > 0.0f) {
                 // convert momentum to velocity, apply gravity
                 cell.v /= cell.mass;
                 cell.v += dt * math.float3(0, gravity, 0);
@@ -455,15 +562,15 @@ public class MPM_Simulation : MonoBehaviour {
                 int x = i % grid_res;
                 int y = (i / grid_res) % grid_res;
                 int z = i / (grid_res * grid_res);
-                if (x < 2 || x > grid_res - 3) { cell.v.x = 0; }
-                if (y < 2 || y > grid_res - 3) { cell.v.y = 0; }
-                if (z < 2 || z > grid_res - 3) { cell.v.z = 0; }
-
+                if (x < 3 || x > grid_res - 2) { cell.v.x = 0; }
+                if (y < 3 || y > grid_res - 2) { cell.v.y = 0; }
+                if (z < 3 || z > grid_res - 2) { cell.v.z = 0; }
+#if PINNED
                 if(cell.pinned)
                 {
                     cell.v = 0;
                 }
-                
+#endif
 
                 grid[i] = cell;
             }
@@ -485,52 +592,68 @@ public class MPM_Simulation : MonoBehaviour {
             p.v = 0;
 
             // quadratic interpolation weights
-            uint3 cell_idx = (uint3)(p.x);
-            float3 cell_diff = ((p.x) - cell_idx) - 0.5f;
+            int3 cell_idx = (int3)(p.x);
+            //float3 cell_diff = ((p.x) - cell_idx) - 0.5f;
             //var weights = stackalloc float3[] {
             //    0.5f * math.pow(0.5f - cell_diff, 2),
             //    0.75f - math.pow(cell_diff, 2), 
             //    0.5f * math.pow(0.5f + cell_diff, 2)
             //};
-            var weights = stackalloc float3[3];
-            weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);
-            weights[1] = 0.75f - math.pow(cell_diff, 2);
-            weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);
+            //var weights = stackalloc float3[DISTANCE];
+            //weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);
+            //weights[1] = 0.75f - math.pow(cell_diff, 2);
+            //weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);
+            //float h = 1.0f;
+            //weights[0] = 0.375f * ((1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
+            //weights[1] = 0.375f * ((-1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));
+            //weights[2] = 0.375f * ((1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));  //  0   -> 0.5
+            //weights[3] = 0.375f * ((-1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
             // constructing affine per-particle momentum matrix from APIC / MLS-MPM.
             // see APIC paper (https://web.archive.org/web/20190427165435/https://www.math.ucla.edu/~jteran/papers/JSSTS15.pdf), page 6
             // below equation 11 for clarification. this is calculating C = B * (D^-1) for APIC equation 8,
             // where B is calculated in the inner loop at (D^-1) = 4 is a constant when using quadratic interpolation functions
-            //float3x3 B = 0;
-            p.C = 0;
-            for (uint gx = 0; gx < DISTANCE; ++gx) {
-                for (uint gy = 0; gy < DISTANCE; ++gy) {
-                    for (uint gz = 0; gz < DISTANCE; ++gz)
+            float3x3 B = 0;
+            //p.C = 0.0f;
+            for (int gx = -DISTANCE; gx <= DISTANCE; ++gx)
+            {
+                for (int gy = -DISTANCE; gy <= DISTANCE; ++gy)
+                {
+                    for (int gz = -DISTANCE; gz <= DISTANCE; ++gz)
                     {
-                        float weight = weights[gx].x * weights[gy].y * weights[gz].z;
-                        uint3 cell_x = math.uint3(cell_idx.x + gx - 1, cell_idx.y + gy - 1, cell_idx.z + gz - 1);
-                        float3 cell_dist = (cell_x - (p.x)) + 0.5f;
+                        float3 pos = cell_idx + new float3(gx, gy, gz);
+                        float3 diff = (p.x - (float3)pos) - 0.5f;
+                        float weight = Interpolate(diff);
+                        float3 dist = ((float3)pos - p.x) + 0.5f;
+                        //float weight = weights[gx].x * weights[gy].y * weights[gz].z;;
+
+                        //uint3 cell_x = math.uint3(cell_idx.x + gx - (DISTANCE - 2), cell_idx.y + gy - (DISTANCE - 2), cell_idx.z + gz - (DISTANCE - 2));
+                        //float3 cell_dist = (cell_x - (p.x)) + 0.5f;
 
                         // scatter mass and momentum to the grid
                         //int cell_index = (int)(((int)cell_x.x + (grid_res * (int)cell_x.y) + (grid_res * grid_res * (int)cell_x.z)) * dx);
-                        int cell_index = (int)cell_x.x + (grid_res * (int)cell_x.y) + (grid_res * grid_res * (int)cell_x.z);
+                        //int cell_index = (int)pos.x + (grid_res * (int)pos.y) + (grid_res * grid_res * (int)pos.z);
+                        int cell_index = GetGridIndex(pos);
+                        //int cell_index = (int)cell_x.x + (grid_res * (int)cell_x.y) + (grid_res * grid_res * (int)cell_x.z);
                         float3 weighted_velocity = grid[cell_index].v * weight;
 
                         // APIC paper equation 10, constructing inner term for B
                         //var term = math.float3x3(weighted_velocity * cell_dist.x, weighted_velocity * cell_dist.y, weighted_velocity * cell_dist.z);
 
                         //B += term;
-                        p.C += 4 * inv_dx * math.float3x3(weighted_velocity * cell_dist.x, weighted_velocity * cell_dist.y, weighted_velocity * cell_dist.z);
+                        var term = math.float3x3(weighted_velocity * dist.x, weighted_velocity * dist.y, weighted_velocity * dist.z);
+                        B += term;
                         p.v += weighted_velocity;
                     }
                 }
             }
+            p.C = B * Dinv;
             // advect particles
-
+            //p.C *= Dinv;
             p.x += p.v * dt;
 
 
             // safety clamp to ensure particles don't exit simulation domain
-            p.x = math.clamp(p.x, 1, grid_res - 2);
+            p.x = math.clamp(p.x, 3, grid_res - 3);
 
 #if MOUSE_INTERACTION
             // mouse interaction
