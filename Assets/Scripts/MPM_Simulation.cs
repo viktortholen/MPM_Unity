@@ -36,6 +36,7 @@ public class MPM_Simulation : MonoBehaviour {
         public float volume_0; // initial volume
         public bool pinned;
         public bool isOuter;
+        public float dp;
         public Matrix4x4 matrix
         {
             get
@@ -48,13 +49,15 @@ public class MPM_Simulation : MonoBehaviour {
     struct Cell {
         public float3 v; // velocity
         public float mass;
+        public float3 N; //Laplacian
+        public float3 di;
         public Vector3Int index3d;
         public bool pinned;
     }
     //Resolutions
     const float particle_size = 0.8f;
     const int grid_res = 64;
-    float3 particle_res = new float3(32,32,16);
+    float3 particle_res = new float3(5,16,5);
     const int num_cells = grid_res * grid_res * grid_res;
 
     // batch size for the job system.
@@ -187,29 +190,15 @@ public class MPM_Simulation : MonoBehaviour {
             num_particles = num_particles
         }.Schedule().Complete();
 
-        float3 max = 0;
-        float3 min = 0;
+        //float3 max = 0;
+        //float3 min = 0;
 
 
         for (int i = 0; i < num_particles; ++i) {
             var p = ps[i];
             // quadratic interpolation weights
             float3 cell_idx = math.floor(p.x); //integer 0-res
-                                               //float3 cell_diff = (p.x - cell_idx) - 0.5f; //float -0.5 -> 0.5
-
-
-            //cell_idx - 1
-            //cell_idx - 1 + 1
-            //cell_idx - 1 + 2
-            //print(cell_diff);
-            //weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);  //  0   -> 0.5
-            //weights[1] = 0.75f - math.pow(cell_diff, 2);        //  0.25-> 0.75
-            //weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);  //  0   -> 0.5
-            //float h = 1.0f;
-            //weights[0] = 0.375f * ((1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
-            //weights[1] = 0.375f * ((-1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));
-            //weights[2] = 0.375f * ((1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));  //  0   -> 0.5
-            //weights[3] = 0.375f * ((-1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
+    
             //if (i == 6343)
             //{ 
 
@@ -224,28 +213,9 @@ public class MPM_Simulation : MonoBehaviour {
                         float3 pos = cell_idx + new float3(gx, gy, gz);
                         float3 diff = (p.x - (float3)pos) - 0.5f; //* cell_diff
                         float weight = Interpolate(diff);
-                        //print(weight + " diff:" + diff + " pos: " + pos);
-                        //if (diff.x > max.x) max.x = diff.x;
-                        //if (diff.y > max.y) max.y = diff.y;
-                        //if (diff.z > max.z) max.z = diff.z;
-                        
-                        //if (diff.x < min.x) min.x = diff.x;
-                        //if (diff.y < min.y) min.y = diff.y;
-                        //if (diff.z < min.z) min.z = diff.z;
-                        //float weight = weights[gx].x * weights[gy].y * weights[gz].z;
-                        //print(pos_x + ", " + pos_y + ", " + pos_z + " -> "+ wx + ", " + wy + ", " + wz);
 
-                        // map 2D to 1D index in grid
-                        //int cell_index = ((int)cell_idx.x + (gx - (DISTANCE - 2))) + (grid_res * ((int)cell_idx.y + gy - (DISTANCE - 2))) + (grid_res * grid_res * ((int)cell_idx.z + (gz - (DISTANCE - 2)))); //??
-                        //int3 cell_x = math.int3(cell_idx.x + gx - (DISTANCE - 2), cell_idx.y + gy - (DISTANCE - 2), cell_idx.z + gz - (DISTANCE - 2));
-                        //int cell_index = (int)pos.x + (grid_res * (int)pos.y) + (grid_res * grid_res * (int)pos.z);
                         int cell_index = GetGridIndex(pos);
-                        // scatter mass and momentum to the grid
-                        //int cell_index = (int)(((int)cell_x.x + (grid_res * (int)cell_x.y) + (grid_res * grid_res * (int)cell_x.z)) * dx);
 
-                        //print("idx" + cell_index + "mass" + grid[cell_index].mass);
-                        //var o = Instantiate(marker, grid[cell_index].index3d, Quaternion.identity);
-                        //o.transform.localScale = new Vector3(weight, weight, weight);
                         density += grid[cell_index].mass * weight;
 #if PINNED
                         if (p.pinned)
@@ -373,6 +343,32 @@ public class MPM_Simulation : MonoBehaviour {
         //if (w < 0.0001) return 0;
         return w;
     }
+    public static float GetFirstDerivative(float x) //cubic
+    {
+        //float x_abs = math.abs(x);
+
+        float dw;
+        if (x < 1.0)
+            dw = math.sign(x)* 1.5f * math.pow(x, 2.0f) - (2.0f*x);
+        else if (x < 2.0f)
+            dw = -math.sign(x) * 0.5f* math.pow(x, 2.0f) - (2.0f * x) - (2.0f * math.sign(x));
+        else dw = 0.0f;
+        //if (w < 0.0001) return 0;
+        return dw;
+    }
+    public static float GetSecondDerivative(float x) //cubic
+    {
+        //float x_abs = math.abs(x);
+
+        float ddw;
+        if (x < 1.0)
+            ddw = (math.sign(x) * 3.0f * x) - ( math.sign(x) * 2.0f);
+        else if (x < 2.0f)
+            ddw = ( -math.sign(x) * x )- (math.sign(x) * 2.0f);
+        else ddw = 0.0f;
+        //if (w < 0.0001) return 0;
+        return ddw;
+    }
 #if MOUSE_INTERACTION
     void HandleMouseInteraction() {
         mouse_down = false;
@@ -465,30 +461,15 @@ public class MPM_Simulation : MonoBehaviour {
                 var P_term_1 = lambda * math.log(J) * F_inv_T;
                 var P = P_term_0 + P_term_1;
 
-                
-                // cauchy_stress = (1 / det(F)) * P * F_T
+
                 // equation 38, MPM course
                 stress = (1.0f / J) * math.mul(P, F_T);
-                
-                // (M_p)^-1 = 4, see APIC paper and MPM course page 42
-                // this term is used in MLS-MPM paper eq. 16. with quadratic weights, Mp = (1/4) * (delta_x)^2.
-                // in this simulation, delta_x = 1, because i scale the rendering of the domain rather than the domain itself.
-                // we multiply by dt as part of the process of fusing the momentum and force update for MLS-MPM
+
                 var eq_16_term_0 = -volume * Dinv * stress * dt;
 
                 // quadratic interpolation weights
                 int3 cell_idx = (int3)(p.x);
-                //float3 cell_diff = (p.x - cell_idx) - 0.5f;
-                //print(cell_diff);
-                //weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);//x = cell_diff
-                //weights[1] = 0.75f - math.pow(cell_diff, 2);//x = cell_diff - 1
-                //weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);//x = cell_diff - 2
-                //float h = 1.0f;
-                //weights[0] = 0.375f * ((1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
-                //weights[1] = 0.375f * ((-1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));
-                //weights[2] = 0.375f * ((1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));  //  0   -> 0.5
-                //weights[3] = 0.375f * ((-1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
-                // for all surrounding 9 cells
+
                 for (int gx = -DISTANCE; gx <= DISTANCE; ++gx)
                 {
                     for (int gy = -DISTANCE; gy <= DISTANCE; ++gy)
@@ -498,14 +479,12 @@ public class MPM_Simulation : MonoBehaviour {
                             float3 pos = cell_idx + new float3(gx, gy, gz);
                             float3 diff = (p.x - (float3)pos) - 0.5f; //kolla vilka värden diff är mellan -> -0.5 i interpoleringen?
                             float weight = Interpolate(diff);
-                            //float weight = weights[gx].x * weights[gy].y * weights[gz].z;
+
+                            
                             float3 dist = ((float3)pos - p.x) + 0.5f;
-                            //int3 cell_x = math.int3(cell_idx.x + gx, cell_idx.y + gy, cell_idx.z + gz);
-                            //float3 cell_dist = (cell_x - p.x) + 0.5f;
                             float3 Q = math.mul(p.C, dist);
 
                             // scatter mass and momentum to the grid
-                            //int cell_index = (int)pos.x + (grid_res * (int)pos.y) + (grid_res * grid_res * (int)pos.z);
                             int cell_index = GetGridIndex(pos);
                             Cell cell = grid[cell_index];
 
@@ -591,27 +570,8 @@ public class MPM_Simulation : MonoBehaviour {
             // reset particle velocity. we calculate it from scratch each step using the grid
             p.v = 0;
 
-            // quadratic interpolation weights
             int3 cell_idx = (int3)(p.x);
-            //float3 cell_diff = ((p.x) - cell_idx) - 0.5f;
-            //var weights = stackalloc float3[] {
-            //    0.5f * math.pow(0.5f - cell_diff, 2),
-            //    0.75f - math.pow(cell_diff, 2), 
-            //    0.5f * math.pow(0.5f + cell_diff, 2)
-            //};
-            //var weights = stackalloc float3[DISTANCE];
-            //weights[0] = 0.5f * math.pow(0.5f - cell_diff, 2);
-            //weights[1] = 0.75f - math.pow(cell_diff, 2);
-            //weights[2] = 0.5f * math.pow(0.5f + cell_diff, 2);
-            //float h = 1.0f;
-            //weights[0] = 0.375f * ((1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
-            //weights[1] = 0.375f * ((-1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));
-            //weights[2] = 0.375f * ((1 / (2 * math.pow(h, 3))) * math.pow(cell_diff, 3) - (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + (4 / 3));  //  0   -> 0.5
-            //weights[3] = 0.375f * ((-1 / (6 * math.pow(h, 3))) * math.pow(cell_diff, 3) + (1 / math.pow(h, 2)) * math.pow(cell_diff, 2) + ((2 / h) * cell_diff) + (4 / 3));  //  0   -> 0.5
-            // constructing affine per-particle momentum matrix from APIC / MLS-MPM.
-            // see APIC paper (https://web.archive.org/web/20190427165435/https://www.math.ucla.edu/~jteran/papers/JSSTS15.pdf), page 6
-            // below equation 11 for clarification. this is calculating C = B * (D^-1) for APIC equation 8,
-            // where B is calculated in the inner loop at (D^-1) = 4 is a constant when using quadratic interpolation functions
+
             float3x3 B = 0;
             //p.C = 0.0f;
             for (int gx = -DISTANCE; gx <= DISTANCE; ++gx)
@@ -670,8 +630,6 @@ public class MPM_Simulation : MonoBehaviour {
 
             // deformation gradient update - MPM course, equation 181
             // Fp' = (I + dt * p.C) * Fp
-            //var Fp = identity;
-            //Fp += dt * p.C;
             p.F = math.mul(identity + (dt* p.C), p.F);
 
             ps[i] = p;
