@@ -1,6 +1,6 @@
-﻿//#define PINNED
+﻿#define PINNED
 //#define CUBIC
-
+#define FORCES
 
 using Unity.Collections;
 using Unity.Jobs;
@@ -11,16 +11,11 @@ using UnityEngine.Jobs;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine.Profiling;
-using Unity.Collections.LowLevel.Unsafe;
-using System.Runtime.InteropServices;
-
-
 
 public class MPM_Simulation : MonoBehaviour {
 
-    public GameObject prefab;
-    public GameObject marker;
-
+    public GameObject ForceObject;
+    const float FORCE_RADIUS = 5.0f;
     public Mesh instancedMesh;
     public Material innerMaterial;
     public Material outerMaterial;
@@ -28,15 +23,15 @@ public class MPM_Simulation : MonoBehaviour {
     private List<List<Particle>> batches = new List<List<Particle>>();
 
     struct Particle {
-        public float3 x; // position
-        public float3 v; // velocity
-        public float3x3 C; // affine momentum matrix
-        public float3x3 F; // affine momentum matrix
+        public float3 x;
+        public float3 v; 
+        public float3x3 C;
+        public float3x3 F;
         public float mass;
-        public float volume_0; // initial volume
+        public float volume;
         public bool pinned;
         public bool isOuter;
-        public float dp;
+        public float dp; //damage
         public Matrix4x4 matrix
         {
             get
@@ -46,27 +41,28 @@ public class MPM_Simulation : MonoBehaviour {
         }
     }
 
-    struct Cell {
-        public float3 v; // velocity
+    struct Node {
+        public float3 v;
         public float mass;
-        public float3 N; //Laplacian
-        public float3 di;
+        public float N; //Laplacian
+        public float di; //damage
         public Vector3Int index3d;
         public bool pinned;
     }
     //Resolutions
-    const float particle_size = 0.8f;
+    const float particle_size = 0.7f;
     const int grid_res = 64;
-    float3 particle_res = new float3(5,16,5);
-    const int num_cells = grid_res * grid_res * grid_res;
+    float3 particle_res = new float3(64,64,8);
+    const float spacing = 0.5f;
+    const int num_nodes = grid_res * grid_res * grid_res;
 
-    // batch size for the job system.
+    // batch size for CPU parallelization
     const int division = 16;
     
     //Parameters
     const float dt = 0.1f; // timestep
     const float iterations = (int)(1.0f / dt);
-    const float gravity = -0.3f;
+    const float gravity = -0.05f;
 
 #if CUBIC
     const int DISTANCE = 2;
@@ -83,11 +79,10 @@ public class MPM_Simulation : MonoBehaviour {
     const float mu = 20.0f; //>= lambda
     
     //Declarations
-    NativeArray<Particle> ps; // particles
-    NativeArray<Cell> grid;
+    NativeArray<Particle> ps; // particle system
+    NativeArray<Node> grid;
 
-    //float3[] weights = new float3[DISTANCE];
-    static readonly float3x3 identity = math.float3x3(
+    static readonly float3x3 identity = math.float3x3( //no identity matrix in math lib.
                 1, 0, 0,
                 0, 1, 0,
                 0, 0, 1
@@ -96,14 +91,8 @@ public class MPM_Simulation : MonoBehaviour {
     List<float3> temp_positions;
     List<int3> temp_indices;
 
-#if MOUSE_INTERACTION
-    // interaction
-    const float mouse_radius = 10;
-    bool mouse_down = false;
-    float3 mouse_pos;
-#endif
-    void createParticles(float3 sp, float3 res) {
-        const float spacing = 0.5f;
+    void createParticles(float3 sp, float3 res) { //create particle box at sp location with resolution res
+       
         float3 real_Res = res * spacing;
         for (float i = 0; i < real_Res[0]; i += spacing) {
             for (float j = 0; j < real_Res[1]; j += spacing) {
@@ -133,13 +122,14 @@ public class MPM_Simulation : MonoBehaviour {
             p.v = 0;
             p.C = 0;
             p.F = identity;
-            
             p.mass = 1.0f;
 
+            //pinning setup
             var p_idx = temp_indices[i];
             if (p_idx[1] > particle_res.y - 3)  { p.pinned = true; } 
             else { p.pinned = false;}
 
+            //Color setup
             if (p_idx.x > particle_res.x - 2 || p_idx.x < 1 || p_idx.y > particle_res.y - 2 || p_idx.y < 1 || p_idx.z < 1 || p_idx.z > particle_res.z - 2) 
             { p.isOuter = true; }
             else { p.isOuter = false; }
@@ -155,13 +145,10 @@ public class MPM_Simulation : MonoBehaviour {
                 currBatch = new List<Particle>();
                 batchIndexNum = 0;
             }
-
-
-
         }
 
         //Initialize grid:
-        grid = new NativeArray<Cell>(num_cells, Allocator.Persistent);
+        grid = new NativeArray<Node>(num_nodes, Allocator.Persistent);
 
         for (int gx = 0; gx < grid_res; ++gx)
         {
@@ -169,15 +156,12 @@ public class MPM_Simulation : MonoBehaviour {
             {
                 for (int gz = 0; gz < grid_res; ++gz)
                 {
-                    // map 3D to 1D index in grid
-                    var cell = new Cell();
-                    cell.v = 0;
-                    cell.index3d = new Vector3Int(gx, gy, gz);
+                    var node = new Node();
+                    node.v = 0;
+                    node.index3d = new Vector3Int(gx, gy, gz);
                     int index = gx + (grid_res *gy) + (grid_res * grid_res * gz);
-                    cell.pinned = false;
-                    grid[index] = cell;
-                    
-
+                    node.pinned = false;
+                    grid[index] = node;
                 }
             }
         }
@@ -190,33 +174,29 @@ public class MPM_Simulation : MonoBehaviour {
             num_particles = num_particles
         }.Schedule().Complete();
 
-        //float3 max = 0;
-        //float3 min = 0;
-
 
         for (int i = 0; i < num_particles; ++i) {
             var p = ps[i];
-            // quadratic interpolation weights
-            float3 cell_idx = math.floor(p.x); //integer 0-res
+            float3 closest_node = math.floor(p.x); //integer 0-res
     
             //if (i == 6343)
             //{ 
 
             float density = 0.0f;
-            // iterate over neighbouring 3x3 cells
+            // iterate over neighbouring 3x3x3 nodes
             for (int gx = -DISTANCE; gx <= DISTANCE; ++gx)
             {
                 for (int gy = -DISTANCE; gy <= DISTANCE; ++gy)
                 {
                     for (int gz = -DISTANCE; gz <= DISTANCE; ++gz)
                     {
-                        float3 pos = cell_idx + new float3(gx, gy, gz);
-                        float3 diff = (p.x - (float3)pos) - 0.5f; //* cell_diff
+                        float3 pos = closest_node + new float3(gx, gy, gz);
+                        float3 diff = (p.x - (float3)pos) - 0.5f;
                         float weight = Interpolate(diff);
 
-                        int cell_index = GetGridIndex(pos);
+                        int node_idx = GetGridIndex(pos);
 
-                        density += grid[cell_index].mass * weight;
+                        density += grid[node_idx].mass * weight;
 #if PINNED
                         if (p.pinned)
                         {
@@ -227,30 +207,15 @@ public class MPM_Simulation : MonoBehaviour {
                 }
             }
             float volume = p.mass / density;
-            p.volume_0 = volume;
-            
-            
-            // per-particle volume estimate has now been computed
-            
+            p.volume = volume;
 
             ps[i] = p;
         }
-        //print(min.x + ", " + min.y + " , " + min.z);
-        //print(max.x + ", " + max.y + " , " + max.z);
 
         batches.Add(currBatch);
 
     }
-    public int itx = 0;
     private void Update() {
-#if MOUSE_INTERACTION
-        HandleMouseInteraction();
-#endif
-        //for(int i = 0; i < iterations; i++)
-        //{
-            
-        //}
-        //itx++;
         Simulate();
         UpdateBatches();
         RenderFrameGPU();
@@ -310,7 +275,20 @@ public class MPM_Simulation : MonoBehaviour {
     {
         return (int)pos.x + (grid_res * (int)pos.y) + (grid_res * grid_res * (int)pos.z);
     }
-    public static float InterpolateCubic(float p)
+    public static float InterpolateQuadratic(float p) //quadratic kernel from MPM course
+    {
+        float x = math.abs(p);
+
+        float w;
+        if (x < 0.5f)
+            w = (3.0f / 4.0f) - math.pow(x, 2.0f);
+        else if (x < 1.5f)
+            w = (1.0f / 2.0f) * math.pow((3.0f / 2.0f) - x, 2.0f);
+        else w = 0.0f;
+        //if (w < 0.0001) return 0;
+        return w;
+    }
+    public static float InterpolateCubic(float p) //cubic kernel from MPM course
     {
         float x = math.abs(p);
 
@@ -330,19 +308,7 @@ public class MPM_Simulation : MonoBehaviour {
 
         return w;
     }
-    public static float InterpolateQuadratic(float p)
-    {
-        float x = math.abs(p);
 
-        float w;
-        if (x < 0.5f)
-            w = (3.0f / 4.0f) - math.pow(x, 2.0f);
-        else if (x < 1.5f)
-            w = (1.0f / 2.0f) * math.pow((3.0f / 2.0f) - x, 2.0f);
-        else w = 0.0f;
-        //if (w < 0.0001) return 0;
-        return w;
-    }
     public static float GetFirstDerivative(float x) //cubic
     {
         //float x_abs = math.abs(x);
@@ -369,28 +335,24 @@ public class MPM_Simulation : MonoBehaviour {
         //if (w < 0.0001) return 0;
         return ddw;
     }
-#if MOUSE_INTERACTION
-    void HandleMouseInteraction() {
-        mouse_down = false;
-        if (Input.GetMouseButton(0)) {
-            mouse_down = true;
-            var mp = Camera.main.ScreenToViewportPoint(Input.mousePosition);
-            mouse_pos = math.float3(mp.x * inv_dx * grid_res, mp.y * grid_res, mp.z * grid_res);
-        }
+    public static float GetLaplacian(float3 x) //cubic
+    {
+
+        return (GetSecondDerivative(x.x) *  InterpolateCubic(x.y)    *  InterpolateCubic(x.z) +
+                InterpolateCubic(x.x)    *  GetSecondDerivative(x.y) *  InterpolateCubic(x.z) +
+                InterpolateCubic(x.x)    *  InterpolateCubic(x.y)    *  GetSecondDerivative(x.z));
     }
-#endif
-    void Simulate() {
+    
+    void Simulate() {  //setup all jobs parallel and send the grid and ps
         Profiler.BeginSample("ClearGrid");
         new Job_ClearGrid() {
             grid = grid
-        }.Schedule(num_cells, division).Complete();
+        }.Schedule(num_nodes, division).Complete();
         Profiler.EndSample();
 
-        // P2G, first round
         Profiler.BeginSample("P2G");
         new Job_P2G() {
             ps = ps,
-            //Fs = Fs,
             grid = grid,
             num_particles = num_particles
         }.Schedule().Complete();
@@ -399,44 +361,42 @@ public class MPM_Simulation : MonoBehaviour {
         Profiler.BeginSample("Update grid");
         new Job_UpdateGrid() {
             grid = grid
-        }.Schedule(num_cells, division).Complete();
+        }.Schedule(num_nodes, division).Complete();
         Profiler.EndSample();
         
         Profiler.BeginSample("G2P");
         new Job_G2P() {
             ps = ps,
-            //Fs = Fs,
-#if MOUSE_INTERACTION
-            mouse_down = mouse_down,
-            mouse_pos = mouse_pos,
-#endif
+            force_pos = (float3)ForceObject.transform.position,
             grid = grid
         }.Schedule(num_particles, division).Complete();
         Profiler.EndSample();
     }
 
-#region Jobs
+#region Jobs 
+    //Jobs are done in parallel with CPU - unsafe is required for math.log which can be unsafe if det(F)
+    //is negative (wont crash the application, particle will be deleted instead)
+
     [BurstCompile]
     struct Job_ClearGrid : IJobParallelFor {
-        public NativeArray<Cell> grid;
+        public NativeArray<Node> grid;
 
         public void Execute(int i) {
-            var cell = grid[i];
-            cell.mass = 0;
-            cell.v = 0;
+            var node = grid[i];
+            node.mass = 0;
+            node.v = 0;
 
-            grid[i] = cell;
+            grid[i] = node;
         }
     }
     
     [BurstCompile]
     unsafe struct Job_P2G : IJob {
-        public NativeArray<Cell> grid;
+        public NativeArray<Node> grid;
         [ReadOnly] public NativeArray<Particle> ps;
         [ReadOnly] public int num_particles;
         
         public void Execute() {
-           // var weights = stackalloc float3[DISTANCE];
 
             for (int i = 0; i < num_particles; ++i) {
                 var p = ps[i];
@@ -449,26 +409,22 @@ public class MPM_Simulation : MonoBehaviour {
                 var J = math.determinant(F);
 
                 // MPM course, page 46
-                var volume = p.volume_0 * J;
-
-                // useful matrices for Neo-Hookean model
-                var F_T = math.transpose(F);
-                var F_inv_T = math.inverse(F_T);
-                var F_minus_F_inv_T = F - F_inv_T;
+                var V = p.volume * J;
 
                 // MPM course equation 48
-                var P_term_0 = mu * (F_minus_F_inv_T);
-                var P_term_1 = lambda * math.log(J) * F_inv_T;
-                var P = P_term_0 + P_term_1;
+                var FT = math.transpose(F);
+                var FinvT = math.inverse(FT);
+                var P0 = mu * (F - FinvT);
+                var P1 = lambda * math.log(J) * FinvT;
+                var P = P0 + P1;
 
 
                 // equation 38, MPM course
-                stress = (1.0f / J) * math.mul(P, F_T);
+                stress = (1.0f / J) * math.mul(P, FT);
 
-                var eq_16_term_0 = -volume * Dinv * stress * dt;
+                var force_term = -V * Dinv * stress * dt;
 
-                // quadratic interpolation weights
-                int3 cell_idx = (int3)(p.x);
+                int3 closest_node = (int3)(p.x);
 
                 for (int gx = -DISTANCE; gx <= DISTANCE; ++gx)
                 {
@@ -476,82 +432,85 @@ public class MPM_Simulation : MonoBehaviour {
                     {
                         for (int gz = -DISTANCE; gz <= DISTANCE; ++gz)
                         {
-                            float3 pos = cell_idx + new float3(gx, gy, gz);
-                            float3 diff = (p.x - (float3)pos) - 0.5f; //kolla vilka värden diff är mellan -> -0.5 i interpoleringen?
+                            float3 pos = closest_node + new float3(gx, gy, gz);
+                            float3 diff = (p.x - (float3)pos) - 0.5f; //-0.5 to interpolate symmetrical
                             float weight = Interpolate(diff);
 
-                            
-                            float3 dist = ((float3)pos - p.x) + 0.5f;
-                            float3 Q = math.mul(p.C, dist);
+                            float3 dist = ((float3)pos - p.x) + 0.5f; //+0.5 to get real distance as -0.5 in interpolation
 
-                            // scatter mass and momentum to the grid
-                            int cell_index = GetGridIndex(pos);
-                            Cell cell = grid[cell_index];
+                            int node_idx = GetGridIndex(pos);
+                            Node node = grid[node_idx];
 
-                            // MPM course, equation 172
+                            // MPM mass equation 172
                             float weighted_mass = weight * p.mass;
-                            cell.mass += weighted_mass;
+                            node.mass += weighted_mass;
 
-                            // APIC P2G momentum contribution
-                            cell.v += weighted_mass * (p.v + Q);
+                            // Momentum MPM 178
+                            node.v += weighted_mass * (p.v + math.mul(p.C, dist));
 
-                            // fused force/momentum update from MLS-MPM
-                            // see MLS-MPM paper, equation listed after eqn. 28
-                            float3 momentum = math.mul(eq_16_term_0 * weight, dist);
-                            cell.v += momentum;
+                            // force equation MLS
+                            float3 force = math.mul(force_term * weight, dist);
+                            node.v += force;
 #if PINNED
                             if (p.pinned)
                             {
-                                cell.v = 0;
-                                cell.pinned = true;
-                                //cell.mass *= 100;
+                                node.v = 0;
+                                node.pinned = true;
                             }
 #endif
-                            // total update on cell.v is now:
-                            // weight * (dt * M^-1 * p.volume * p.stress + p.mass * p.C)
-                            // this is the fused momentum + force from MLS-MPM. however, instead of our stress being derived from the energy density,
-                            // i use the weak form with cauchy stress. converted:
-                            // p.volume_0 * (dΨ/dF)(Fp)*(Fp_transposed)
-                            // is equal to p.volume * σ
 
-                            // note: currently "cell.v" refers to MOMENTUM, not velocity!
-                            // this gets converted in the UpdateGrid step below.
+                            //Aniso: Compute and store Laplacians (Explicit)
+                            //node.di += weight * p.dp;
+                            //node.N = GetLaplacian(diff);
+                            //p.dp += node.di * node.N;
 
-                            grid[cell_index] = cell;
+                            grid[node_idx] = node;
                         }
                     }
                 }
+                //Update Anisotropic Damage (Explicit only)*******************************************
+
+                //Compute geometric resistance: D
+                //Compute driving force:
+                //Get un-degraded Cauchy stress
+                //Get eigenvalues and eigenvectors
+                //Calculate stress (new way)
+                //constructStructuralTensor
+                //Calculate elastic thingy (instead of eq 48)
+                //apply critical stress conditions and set damage
+
+                //************************************************************************************
             }
         }
     }
 
     [BurstCompile]
     struct Job_UpdateGrid : IJobParallelFor {
-        public NativeArray<Cell> grid;
+        public NativeArray<Node> grid;
 
         public void Execute(int i) {
-            var cell = grid[i];
+            var node = grid[i];
 
-            if (cell.mass > 0.0f) {
+            if (node.mass > 0.0f) {
                 // convert momentum to velocity, apply gravity
-                cell.v /= cell.mass;
-                cell.v += dt * math.float3(0, gravity, 0);
+                node.v /= node.mass;
+                node.v += dt * math.float3(0, gravity, 0);
 
-                // 'slip' boundary conditions
+
+                //boundaries
                 int x = i % grid_res;
                 int y = (i / grid_res) % grid_res;
                 int z = i / (grid_res * grid_res);
-                if (x < 3 || x > grid_res - 2) { cell.v.x = 0; }
-                if (y < 3 || y > grid_res - 2) { cell.v.y = 0; }
-                if (z < 3 || z > grid_res - 2) { cell.v.z = 0; }
+                if (x < 3 || x > grid_res - 2) { node.v.x = 0; }
+                if (y < 3 || y > grid_res - 2) { node.v.y = 0; }
+                if (z < 3 || z > grid_res - 2) { node.v.z = 0; }
 #if PINNED
-                if(cell.pinned)
+                if(node.pinned)
                 {
-                    cell.v = 0;
+                    node.v = 0;
                 }
 #endif
-
-                grid[i] = cell;
+                grid[i] = node;
             }
         }
     }
@@ -559,10 +518,8 @@ public class MPM_Simulation : MonoBehaviour {
     [BurstCompile]
     unsafe struct Job_G2P : IJobParallelFor {
         public NativeArray<Particle> ps;
-        [ReadOnly] public NativeArray<Cell> grid;
-
-        [ReadOnly] public bool mouse_down;
-        [ReadOnly] public float3 mouse_pos;
+        [ReadOnly] public NativeArray<Node> grid;
+        [ReadOnly] public float3 force_pos;
         
         public void Execute(int i) {
             Particle p = ps[i];
@@ -570,36 +527,24 @@ public class MPM_Simulation : MonoBehaviour {
             // reset particle velocity. we calculate it from scratch each step using the grid
             p.v = 0;
 
-            int3 cell_idx = (int3)(p.x);
+            int3 closest_node = (int3)(p.x);
 
             float3x3 B = 0;
-            //p.C = 0.0f;
             for (int gx = -DISTANCE; gx <= DISTANCE; ++gx)
             {
                 for (int gy = -DISTANCE; gy <= DISTANCE; ++gy)
                 {
                     for (int gz = -DISTANCE; gz <= DISTANCE; ++gz)
                     {
-                        float3 pos = cell_idx + new float3(gx, gy, gz);
+                        float3 pos = closest_node + new float3(gx, gy, gz);
                         float3 diff = (p.x - (float3)pos) - 0.5f;
                         float weight = Interpolate(diff);
                         float3 dist = ((float3)pos - p.x) + 0.5f;
-                        //float weight = weights[gx].x * weights[gy].y * weights[gz].z;;
 
-                        //uint3 cell_x = math.uint3(cell_idx.x + gx - (DISTANCE - 2), cell_idx.y + gy - (DISTANCE - 2), cell_idx.z + gz - (DISTANCE - 2));
-                        //float3 cell_dist = (cell_x - (p.x)) + 0.5f;
+                        int node_idx = GetGridIndex(pos);
+                        float3 weighted_velocity = grid[node_idx].v * weight;
 
-                        // scatter mass and momentum to the grid
-                        //int cell_index = (int)(((int)cell_x.x + (grid_res * (int)cell_x.y) + (grid_res * grid_res * (int)cell_x.z)) * dx);
-                        //int cell_index = (int)pos.x + (grid_res * (int)pos.y) + (grid_res * grid_res * (int)pos.z);
-                        int cell_index = GetGridIndex(pos);
-                        //int cell_index = (int)cell_x.x + (grid_res * (int)cell_x.y) + (grid_res * grid_res * (int)cell_x.z);
-                        float3 weighted_velocity = grid[cell_index].v * weight;
-
-                        // APIC paper equation 10, constructing inner term for B
-                        //var term = math.float3x3(weighted_velocity * cell_dist.x, weighted_velocity * cell_dist.y, weighted_velocity * cell_dist.z);
-
-                        //B += term;
+                        // inner term for B
                         var term = math.float3x3(weighted_velocity * dist.x, weighted_velocity * dist.y, weighted_velocity * dist.z);
                         B += term;
                         p.v += weighted_velocity;
@@ -607,29 +552,19 @@ public class MPM_Simulation : MonoBehaviour {
                 }
             }
             p.C = B * Dinv;
-            // advect particles
-            //p.C *= Dinv;
             p.x += p.v * dt;
-
-
-            // safety clamp to ensure particles don't exit simulation domain
             p.x = math.clamp(p.x, 3, grid_res - 3);
 
-#if MOUSE_INTERACTION
-            // mouse interaction
-            if (mouse_down) {
-                var dist = p.x * inv_dx - mouse_pos;
-                if (math.dot(dist, dist) < mouse_radius * mouse_radius) {
-                    float norm_factor = (math.length(dist) / mouse_radius);
-                    norm_factor = math.pow(math.sqrt(norm_factor), 8);
-                    var force = math.normalize(dist) * norm_factor * 0.5f;
-                    p.v += force;
-                }
+#if FORCES
+            var force_dist = p.x * inv_dx - force_pos;
+            if(math.dot(force_dist, force_dist) < FORCE_RADIUS * FORCE_RADIUS)
+            {
+                float norm = math.pow(math.sqrt((math.length(force_dist) / FORCE_RADIUS)), 8);
+                float3 force = math.normalize(force_dist) * norm * 1.0f;
+                p.v += force;
             }
-#endif
-
-            // deformation gradient update - MPM course, equation 181
-            // Fp' = (I + dt * p.C) * Fp
+#endif  
+            // equation 181
             p.F = math.mul(identity + (dt* p.C), p.F);
 
             ps[i] = p;
